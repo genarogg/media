@@ -16,8 +16,67 @@
 # detenido y requiere intervención manual por SSH para levantarlo de
 # nuevo (sin Coolify arriba, su propio dashboard deja de responder).
 #
-# Pensado para correr como servicio systemd (ver cpu-guard.service).
+# Este script se auto-instala como servicio systemd la primera vez que se
+# ejecuta manualmente, para que quede corriendo en segundo plano y arranque
+# solo con el servidor. Las siguientes ejecuciones (las de systemd) saltan
+# este bloque y van directo a la lógica de monitoreo.
+
+# para ejecutar
+# curl -o cpu-guard.sh https://genarogg.github.io/media/server/cpu-guard2.sh
+# sudo bash cpu-guard.sh
 set -u
+
+INSTALL_PATH="/usr/local/bin/cpu-guard.sh"
+SERVICE_PATH="/etc/systemd/system/cpu-guard.service"
+SERVICE_NAME="cpu-guard"
+
+auto_instalar_servicio() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Este script necesita permisos de root. Ejecuta: sudo bash $0"
+    exit 1
+  fi
+
+  echo "==> Instalando cpu-guard como servicio systemd..."
+
+  # Copia el script a una ruta estable si no está ya ahí
+  if [ "$(readlink -f "$0")" != "$INSTALL_PATH" ]; then
+    cp "$0" "$INSTALL_PATH"
+    chmod +x "$INSTALL_PATH"
+  fi
+
+  # Crea la unidad systemd
+  cat > "$SERVICE_PATH" << EOF
+[Unit]
+Description=CPU Guard - detiene contenedores no-Coolify si la CPU se sostiene alta
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash $INSTALL_PATH
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "$SERVICE_NAME"
+  systemctl restart "$SERVICE_NAME"
+
+  echo "==> Listo. El servicio quedó instalado, habilitado y corriendo."
+  echo "    Ver estado: sudo systemctl status $SERVICE_NAME"
+  echo "    Ver logs:   sudo tail -f /var/log/cpu-guard.log"
+  exit 0
+}
+
+# Si no se está ejecutando como el propio servicio systemd, auto-instalarse.
+# (systemd invoca este script con el mismo INSTALL_PATH; detectamos la
+# ejecución manual comparando la variable de entorno que systemd no define).
+if [ -z "${INVOCATION_ID:-}" ]; then
+  auto_instalar_servicio
+fi
 
 # ---------------------- Configuración ----------------------
 UMBRAL=97                 # % de uso de CPU que dispara la acción
