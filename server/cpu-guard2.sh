@@ -22,8 +22,11 @@
 # este bloque y van directo a la lógica de monitoreo.
 
 # para ejecutar
-# curl -o cpu-guard.sh https://genarogg.github.io/media/server/cpu-guard2.sh
+# curl -o cpu-guard.sh https://genarogg.github.io/media/server/cpu-guard.sh
 # sudo bash cpu-guard.sh
+
+# revisar
+# sudo systemctl status cpu-guard
 set -u
 
 INSTALL_PATH="/usr/local/bin/cpu-guard.sh"
