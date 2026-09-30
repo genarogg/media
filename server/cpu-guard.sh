@@ -23,12 +23,20 @@
 # queda documentado en su propio archivo dentro de DIR_INCIDENTES, además
 # del log continuo en LOG_FILE.
 #
-# Freno contra reinicios en bucle: si en una hora se acumulan
-# MAX_REINICIOS_POR_HORA reinicios automáticos (por defecto 3), se asume que
-# el problema no se resuelve solo con reiniciar. En ese caso el script deja
-# de reiniciar el servidor y de levantar contenedores: todo queda apagado
-# hasta que alguien revise el servidor a mano y borre el archivo
-# /var/lib/cpu-guard/bloqueado (el log indica la ruta exacta cuando pasa).
+# Freno contra reinicios en bucle: el proceso normal (Nivel 1 -> Nivel 2 ->
+# reinicio -> restauración) sigue igual siempre. La única diferencia es
+# cuando, en una hora, ya se acumularon MAX_REINICIOS_POR_HORA reinicios
+# automáticos (por defecto 3): ahí se asume que el problema no se resuelve
+# solo con reiniciar, así que esa vez NO se reinicia el servidor. En su
+# lugar se activa un bloqueo temporal de BLOQUEO_ESPERA_MINUTOS minutos
+# (por defecto 60) con todos los contenedores apagados. El servicio y su
+# loop de monitoreo de CPU NUNCA se detienen durante ese bloqueo; solo se
+# evita volver a actuar mientras dure. Pasada la hora, el propio script
+# levanta de nuevo todos los contenedores automáticamente, sin intervención
+# manual, y el ciclo continúa exactamente igual que siempre (si la CPU
+# vuelve a dispararse, puede volver a pasar por Nivel 1, Nivel 2, etc., con
+# normalidad). Para forzar la restauración antes de que se cumpla la hora,
+# se puede borrar /var/lib/cpu-guard/bloqueado a mano en cualquier momento.
 #
 # Los contenedores que pertenecen a un mismo proyecto de docker compose
 # (misma etiqueta com.docker.compose.project) se detienen y se vuelven a
@@ -117,6 +125,7 @@ COOLDOWN_SEGUNDOS=600     # tras el Nivel 1, espera antes de poder volver a disp
 REINICIO_ESPERA_MINUTOS=5   # minutos de espera antes de reiniciar el servidor tras el Nivel 2
 ESPERA_COOLIFY_SEGUNDOS=20  # segundos de margen tras levantar Coolify antes de levantar el resto
 MAX_REINICIOS_POR_HORA=3    # tope de reinicios automáticos en 1 hora antes de deshabilitar el auto-recovery
+BLOQUEO_ESPERA_MINUTOS=60   # minutos que permanece todo apagado tras el bloqueo antes de auto-restaurar
 
 # Directorios de estado (persisten entre reinicios) y de logs
 DIR_ESTADO="/var/lib/cpu-guard"
@@ -125,11 +134,11 @@ mkdir -p "$DIR_ESTADO" "$DIR_INCIDENTES"
 
 LOG_FILE="/var/log/cpu-guard/cpu-guard.log"
 SNAPSHOT_ACTUAL="${DIR_ESTADO}/snapshot-actual.list"     # foto de "docker ps" al inicio del incidente actual
-REGISTRO_RESTAURAR="${DIR_ESTADO}/restaurar.list"        # qué restaurar tras el reinicio (solo si hubo Nivel 2)
+REGISTRO_RESTAURAR="${DIR_ESTADO}/restaurar.list"        # qué restaurar tras el reinicio o el bloqueo
 MARCADOR_RESTAURAR="${DIR_ESTADO}/restaurar.pending"     # existe => hay que restaurar al arrancar
 ARCHIVO_INCIDENTE_ACTUAL="${DIR_ESTADO}/incidente-actual.txt"  # ruta del .log del incidente en curso
 REGISTRO_REINICIOS="${DIR_ESTADO}/reinicios.log"         # timestamps (epoch) de cada reinicio automático
-BLOQUEADO="${DIR_ESTADO}/bloqueado"                      # si existe, el auto-recovery está deshabilitado
+BLOQUEADO="${DIR_ESTADO}/bloqueado"                      # si existe, el auto-recovery está deshabilitado (temporalmente)
 INCIDENTE_ACTUAL=""
 
 # Contenedores de Coolify que el Nivel 1 NUNCA detiene.
@@ -308,22 +317,16 @@ registrar_reinicio() {
 # Guarda el registro de todo lo que había corriendo (para restaurarlo tras
 # el reinicio) y programa el reinicio del servidor con `shutdown -r`.
 # Si ya se acumularon MAX_REINICIOS_POR_HORA reinicios en la última hora,
-# NO reinicia: deja todo apagado y deshabilita el auto-recovery hasta que
-# alguien lo revise a mano.
+# NO reinicia el servidor: en vez de eso activa el bloqueo temporal (ver
+# activar_bloqueo), que deja los contenedores apagados una hora mientras el
+# script sigue corriendo y monitoreando con normalidad.
 programar_reinicio() {
-  if [ -f "$BLOQUEADO" ]; then
-    log "El auto-recovery ya está deshabilitado (demasiados reinicios recientes). No se reinicia ni se restaura nada; los contenedores quedan apagados."
-    return
-  fi
-
   local recientes
   recientes=$(reinicios_recientes)
   if [ "$recientes" -ge "$MAX_REINICIOS_POR_HORA" ]; then
     log "Se alcanzó el máximo de ${MAX_REINICIOS_POR_HORA} reinicios automáticos en la última hora."
-    log "Se DESHABILITA el auto-recovery: los contenedores quedan TODOS apagados y no se reiniciará más el servidor."
-    log "Para reactivarlo: revisa qué está pasando, levanta los servicios a mano y borra ${BLOQUEADO}"
-    touch "$BLOQUEADO"
-    rm -f "$REGISTRO_RESTAURAR" "$MARCADOR_RESTAURAR"
+    log "No se reiniciará el servidor esta vez. Se activa el bloqueo temporal en su lugar."
+    activar_bloqueo
     return
   fi
 
@@ -341,6 +344,20 @@ programar_reinicio() {
   shutdown -r "+${REINICIO_ESPERA_MINUTOS}" \
     "cpu-guard: reinicio automatico tras detener todos los contenedores (CPU sostenida >= ${UMBRAL}%)" \
     >> "$LOG_FILE" 2>&1
+}
+
+# Activa el bloqueo temporal: guarda el registro de lo que hay que
+# restaurar y crea el archivo BLOQUEADO con la hora en que se creó (su
+# mtime es la referencia para saber cuándo se cumple BLOQUEO_ESPERA_MINUTOS).
+# El script NO se detiene ni deja de monitorear: el loop principal sigue su
+# curso normal, simplemente no vuelve a actuar mientras BLOQUEADO exista.
+activar_bloqueo() {
+  cp "$SNAPSHOT_ACTUAL" "$REGISTRO_RESTAURAR"
+  touch "$BLOQUEADO"
+  log "Bloqueo activado. Los contenedores quedan apagados durante ${BLOQUEO_ESPERA_MINUTOS} minuto(s)."
+  log "El monitoreo de CPU sigue activo; pasado ese tiempo se restaurará todo automáticamente y el ciclo continuará normal."
+  log "(para forzar la restauración antes, borra ${BLOQUEADO} a mano)"
+  cerrar_incidente
 }
 
 # Tras el Nivel 1, vigila SEGUNDOS_ESCALADA segundos más. Si la CPU se
@@ -370,13 +387,7 @@ verificar_escalada() {
 # docker compose (todos los servicios de un mismo proyecto en un solo
 # `docker start`, para que suban juntos), y por último los sueltos.
 restaurar_contenedores() {
-  if [ -f "$BLOQUEADO" ]; then
-    log "Auto-recovery deshabilitado (demasiados reinicios recientes). No se restaura nada; los contenedores siguen apagados a propósito."
-    rm -f "$MARCADOR_RESTAURAR"
-    return
-  fi
-
-  log "=== Servidor reiniciado. Restaurando contenedores detenidos... ==="
+  log "=== Restaurando contenedores detenidos... ==="
 
   local intentos=0
   until docker info >/dev/null 2>&1; do
@@ -449,20 +460,28 @@ restaurar_contenedores() {
   INCIDENTE_ACTUAL=""
 }
 
-# ---------------------- Freno por exceso de reinicios ----------------------
-# Si el auto-recovery quedó deshabilitado (demasiados reinicios en poco
-# tiempo), no se monitorea ni se restaura nada: se espera en silencio a que
-# alguien revise el servidor a mano y borre el archivo de bloqueo. En cuanto
-# se borra, retoma el monitoreo normal sin necesidad de reiniciar el
-# servicio.
-if [ -f "$BLOQUEADO" ]; then
-  log "cpu-guard: auto-recovery deshabilitado (se alcanzó el máximo de ${MAX_REINICIOS_POR_HORA} reinicios en una hora)."
-  log "No se tomará ninguna acción hasta que borres ${BLOQUEADO} a mano."
-  while [ -f "$BLOQUEADO" ]; do
-    sleep 60
-  done
-  log "Se detectó que se borró ${BLOQUEADO}. Reanudando el monitoreo normal."
-fi
+# Revisa si el bloqueo temporal (activado por exceso de reinicios) ya
+# cumplió su tiempo, o si alguien lo borró a mano. En cualquiera de los dos
+# casos, restaura todos los contenedores y limpia el estado de bloqueo.
+# Se llama en cada vuelta del loop principal mientras BLOQUEADO exista, así
+# que el monitoreo de CPU nunca se detiene mientras se espera.
+verificar_fin_bloqueo() {
+  if [ ! -f "$BLOQUEADO" ]; then
+    return
+  fi
+
+  local creado ahora limite
+  creado=$(stat -c %Y "$BLOQUEADO" 2>/dev/null || echo 0)
+  ahora=$(date +%s)
+  limite=$((creado + BLOQUEO_ESPERA_MINUTOS * 60))
+
+  if [ "$ahora" -ge "$limite" ]; then
+    log "Se cumplieron ${BLOQUEO_ESPERA_MINUTOS} minuto(s) de bloqueo. Restaurando todos los contenedores automáticamente."
+    rm -f "$BLOQUEADO"
+    restaurar_contenedores
+    log "Bloqueo levantado. El ciclo de monitoreo continúa normal."
+  fi
+}
 
 # ---------------------- Restauración tras reinicio ----------------------
 # Si al arrancar existe el marcador, significa que en el arranque anterior
@@ -480,6 +499,14 @@ log "cpu-guard iniciado. Umbral=${UMBRAL}% sostenido ${SEGUNDOS_SOSTENIDOS}s (Ni
 contador=0
 ultimo_disparo=0
 while true; do
+  # Si hay un bloqueo temporal activo (por exceso de reinicios), el
+  # monitoreo de CPU sigue leyendo con normalidad, pero no se dispara
+  # ninguna acción nueva hasta que se cumpla la hora de espera (o alguien
+  # borre el bloqueo a mano). verificar_fin_bloqueo se encarga de eso y,
+  # en cuanto se cumple, restaura los contenedores y el ciclo sigue igual
+  # que siempre.
+  verificar_fin_bloqueo
+
   uso=$(obtener_uso_cpu)
   ahora=$(date +%s)
 
@@ -489,7 +516,7 @@ while true; do
     contador=0
   fi
 
-  if [ "$contador" -ge "$LECTURAS_NECESARIAS" ]; then
+  if [ "$contador" -ge "$LECTURAS_NECESARIAS" ] && [ ! -f "$BLOQUEADO" ]; then
     tiempo_desde_ultimo=$((ahora - ultimo_disparo))
     if [ "$tiempo_desde_ultimo" -ge "$COOLDOWN_SEGUNDOS" ]; then
       iniciar_incidente
