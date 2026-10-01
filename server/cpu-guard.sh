@@ -4,10 +4,30 @@
 #
 # Monitorea el uso de CPU del VPS.
 #
-# Nivel 1: si se mantiene en >= UMBRAL% durante SEGUNDOS_SOSTENIDOS segundos
-# seguidos, detiene todos los contenedores Docker EXCEPTO los propios de
-# Coolify (coolify, coolify-proxy, coolify-db, coolify-redis,
-# coolify-realtime, coolify-sentinel).
+# Nivel 0 (quirúrgico): al cumplirse SEGUNDOS_SOSTENIDOS con CPU sostenida
+# >= UMBRAL%, el script mide con `docker stats` el consumo de CPU de todos
+# los contenedores EXCEPTO los de Coolify, y suma ese consumo por proyecto
+# de docker compose (stack). Identifica el stack con mayor consumo total y
+# detiene SOLO esos contenedores, dejando el resto (incluido Coolify)
+# funcionando con normalidad. Si ningún contenedor no-Coolify pertenece a
+# un proyecto de docker compose (todos son contenedores sueltos, sin
+# stack), no hay un "stack problemático" que aislar y se salta
+# directamente al Nivel 1.
+#
+# Tras detener el stack, se vigila una ventana corta (SEGUNDOS_ESCALADA):
+#   - Si la CPU sigue en >= UMBRAL% toda la ventana, se asume que el
+#     problema no era ese stack y se escala al Nivel 1 (detiene TODOS los
+#     contenedores no-Coolify, incluido lo que quedaba encendido).
+#   - Si la CPU baja del umbral, se pasa a una ventana de confirmación
+#     (SEGUNDOS_CONFIRMACION). Si la CPU se mantiene estable y por debajo
+#     del umbral todo ese tiempo, se restaura automáticamente SOLO el
+#     stack que se había detenido. Si la CPU vuelve a subir al umbral
+#     durante la confirmación, se escala directamente al Nivel 1.
+#
+# Nivel 1: si el Nivel 0 no resolvió el problema (o no aplicaba), se
+# detienen todos los contenedores Docker EXCEPTO los propios de Coolify
+# (coolify, coolify-proxy, coolify-db, coolify-redis, coolify-realtime,
+# coolify-sentinel).
 #
 # Nivel 2 (escalada): si, tras la acción del Nivel 1, la CPU se mantiene en
 # >= UMBRAL% durante SEGUNDOS_ESCALADA segundos MÁS, se asume que el
@@ -18,6 +38,16 @@
 # corriendo y, tras REINICIO_ESPERA_MINUTOS minutos, el propio script
 # reinicia el servidor (vía `shutdown -r`) y, al arrancar de nuevo,
 # restaura automáticamente los contenedores que se habían detenido.
+#
+# Restauración automática del Nivel 1: si tras el Nivel 1 la CPU baja del
+# umbral antes de completar la ventana de escalada, en vez de dejar los
+# contenedores no-Coolify apagados indefinidamente, el script espera una
+# ventana de confirmación de SEGUNDOS_CONFIRMACION segundos con la CPU
+# estable y por debajo del umbral. Si se cumple, restaura automáticamente
+# esos contenedores. Si durante esa ventana la CPU vuelve a subir al
+# umbral, se asume que el problema persiste y se escala directamente al
+# Nivel 2 (apagar también Coolify + reinicio automático del servidor),
+# igual que si hubiera escalado desde el principio.
 #
 # Cada incidente (Nivel 1 y, si escala, Nivel 2 + reinicio + restauración)
 # queda documentado en su propio archivo dentro de DIR_INCIDENTES, además
@@ -118,8 +148,10 @@ UMBRAL=97                 # % de uso de CPU que dispara la acción
 INTERVALO=10              # segundos entre cada lectura
 SEGUNDOS_SOSTENIDOS=90    # tiempo sostenido antes de actuar (Nivel 1)
 SEGUNDOS_ESCALADA=60      # tiempo sostenido ADICIONAL tras el Nivel 1 antes de escalar (Nivel 2)
+SEGUNDOS_CONFIRMACION=120 # tiempo sostenido POR DEBAJO del umbral antes de restaurar el Nivel 1
 LECTURAS_NECESARIAS=$(( SEGUNDOS_SOSTENIDOS / INTERVALO ))
 LECTURAS_ESCALADA=$(( SEGUNDOS_ESCALADA / INTERVALO ))
+LECTURAS_CONFIRMACION=$(( SEGUNDOS_CONFIRMACION / INTERVALO ))
 COOLDOWN_SEGUNDOS=600     # tras el Nivel 1, espera antes de poder volver a disparar
 
 REINICIO_ESPERA_MINUTOS=5   # minutos de espera antes de reiniciar el servidor tras el Nivel 2
@@ -140,6 +172,7 @@ ARCHIVO_INCIDENTE_ACTUAL="${DIR_ESTADO}/incidente-actual.txt"  # ruta del .log d
 REGISTRO_REINICIOS="${DIR_ESTADO}/reinicios.log"         # timestamps (epoch) de cada reinicio automático
 BLOQUEADO="${DIR_ESTADO}/bloqueado"                      # si existe, el auto-recovery está deshabilitado (temporalmente)
 INCIDENTE_ACTUAL=""
+STACK_NIVEL0=""     # si el incidente actual está en modo Nivel 0, nombre del proyecto detenido; vacío si no aplica
 
 # Contenedores de Coolify que el Nivel 1 NUNCA detiene.
 # El Nivel 2 sí los detiene — es la escalada máxima.
@@ -200,7 +233,7 @@ iniciar_incidente() {
 }
 
 # Cierra el incidente actual sin haber llegado al Nivel 2 (la CPU se
-# normalizó durante la ventana de escalada).
+# normalizó y, si correspondía, ya se restauraron los contenedores).
 cerrar_incidente() {
   rm -f "$ARCHIVO_INCIDENTE_ACTUAL"
   INCIDENTE_ACTUAL=""
@@ -212,6 +245,180 @@ cerrar_incidente() {
 # Nivel 1, qué se detiene en el Nivel 2, y qué se restaura después).
 capturar_snapshot_actual() {
   docker ps --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.service"}}' > "$SNAPSHOT_ACTUAL"
+}
+
+# Mide con `docker stats` el consumo de CPU de los contenedores no-Coolify
+# del snapshot actual y suma ese consumo por proyecto de docker compose.
+# Devuelve (por stdout) el nombre del proyecto con mayor consumo total, o
+# nada si ningún contenedor no-Coolify pertenece a un proyecto (todos
+# sueltos). El resultado también queda logueado con el detalle del cálculo.
+identificar_stack_mas_pesado() {
+  if [ ! -s "$SNAPSHOT_ACTUAL" ]; then
+    return
+  fi
+
+  local ids_no_coolify=()
+  local -A proyecto_de_id
+  while IFS='|' read -r id nombre imagen proyecto servicio; do
+    [ -z "$id" ] && continue
+    local es_coolify=false
+    for ex in "${EXCLUIDOS[@]}"; do
+      [ "$nombre" == "$ex" ] && es_coolify=true && break
+    done
+    [ "$es_coolify" = true ] && continue
+    [ -z "$proyecto" ] && continue   # contenedor suelto: no puede ser "stack problemático"
+    ids_no_coolify+=("$id")
+    proyecto_de_id["$id"]="$proyecto"
+  done < "$SNAPSHOT_ACTUAL"
+
+  if [ "${#ids_no_coolify[@]}" -eq 0 ]; then
+    log "Nivel 0: ningún contenedor no-Coolify pertenece a un proyecto docker compose. No hay stack que aislar."
+    return
+  fi
+
+  local -A suma_cpu_por_proyecto
+  local linea id cpu_str cpu_num proyecto
+  while IFS='|' read -r id cpu_str; do
+    [ -z "$id" ] && continue
+    proyecto="${proyecto_de_id[$id]:-}"
+    [ -z "$proyecto" ] && continue
+    cpu_num="${cpu_str%\%}"
+    cpu_num="${cpu_num%%.*}"   # trunca a entero, suficiente para comparar
+    [[ "$cpu_num" =~ ^[0-9]+$ ]] || cpu_num=0
+    suma_cpu_por_proyecto["$proyecto"]=$(( ${suma_cpu_por_proyecto[$proyecto]:-0} + cpu_num ))
+  done < <(docker stats --no-stream --format '{{.ID}}|{{.CPUPerc}}' "${ids_no_coolify[@]}" 2>>"$LOG_FILE")
+
+  local mejor_proyecto="" mejor_cpu=-1
+  for proyecto in "${!suma_cpu_por_proyecto[@]}"; do
+    log "Nivel 0: stack '${proyecto}' consume ${suma_cpu_por_proyecto[$proyecto]}% de CPU sumado."
+    if [ "${suma_cpu_por_proyecto[$proyecto]}" -gt "$mejor_cpu" ]; then
+      mejor_cpu="${suma_cpu_por_proyecto[$proyecto]}"
+      mejor_proyecto="$proyecto"
+    fi
+  done
+
+  if [ -n "$mejor_proyecto" ]; then
+    log "Nivel 0: stack identificado como más pesado: '${mejor_proyecto}' (${mejor_cpu}% sumado)."
+    echo "$mejor_proyecto"
+  fi
+}
+
+# Detiene únicamente los contenedores del snapshot actual que pertenezcan
+# al proyecto de docker compose indicado. Devuelve 0 si detuvo algo, 1 si
+# no encontró contenedores de ese proyecto en el snapshot.
+detener_stack() {
+  local proyecto_objetivo="$1"
+  local a_detener=()
+  while IFS='|' read -r id nombre imagen proyecto servicio; do
+    [ -z "$id" ] && continue
+    [ "$proyecto" == "$proyecto_objetivo" ] || continue
+    log "  se detendrá (Nivel 0, stack '${proyecto_objetivo}'): $nombre ($id) imagen=$imagen [servicio: ${servicio}]"
+    a_detener+=("$id")
+  done < "$SNAPSHOT_ACTUAL"
+
+  if [ "${#a_detener[@]}" -eq 0 ]; then
+    return 1
+  fi
+
+  docker stop "${a_detener[@]}" >> "$LOG_FILE" 2>&1
+  log "Listo. ${#a_detener[@]} contenedor(es) del stack '${proyecto_objetivo}' detenidos."
+  return 0
+}
+
+# Restaura únicamente los contenedores del snapshot actual que pertenezcan
+# al proyecto de docker compose indicado, en un solo `docker start`.
+restaurar_stack() {
+  local proyecto_objetivo="$1"
+  local ids=()
+  while IFS='|' read -r id nombre imagen proyecto servicio; do
+    [ -z "$id" ] && continue
+    [ "$proyecto" == "$proyecto_objetivo" ] || continue
+    ids+=("$id")
+  done < "$SNAPSHOT_ACTUAL"
+
+  if [ "${#ids[@]}" -eq 0 ]; then
+    log "Nivel 0: no se encontraron contenedores del stack '${proyecto_objetivo}' en el snapshot. Nada que restaurar."
+    return
+  fi
+
+  log "  levantando stack '${proyecto_objetivo}': ${ids[*]}"
+  docker start "${ids[@]}" >> "$LOG_FILE" 2>&1
+}
+
+# Punto de entrada del Nivel 0. Intenta aislar y detener solo el stack más
+# pesado. Si lo logra, vigila su propia ventana de escalada/confirmación y
+# termina ahí (restaurando el stack o escalando al Nivel 1 según toque).
+# Si no hay un stack que aislar, cae directo al Nivel 1 clásico.
+intentar_nivel0() {
+  local stack
+  stack="$(identificar_stack_mas_pesado)"
+
+  if [ -z "$stack" ]; then
+    log "Nivel 0: se omite (sin stack identificable). Se pasa directo al Nivel 1."
+    detener_contenedores_no_coolify
+    verificar_escalada
+    return
+  fi
+
+  log "NIVEL 0: umbral sostenido detectado. Aislando y deteniendo solo el stack '${stack}'..."
+  if ! detener_stack "$stack"; then
+    log "Nivel 0: el stack '${stack}' ya no tiene contenedores corriendo. Se pasa al Nivel 1."
+    detener_contenedores_no_coolify
+    verificar_escalada
+    return
+  fi
+
+  STACK_NIVEL0="$stack"
+  verificar_escalada_nivel0
+}
+
+# Tras detener solo el stack en el Nivel 0, vigila SEGUNDOS_ESCALADA
+# segundos. Si la CPU se mantiene en >= UMBRAL% toda la ventana, se asume
+# que ese stack no era (o no era el único) problema y se escala al Nivel 1
+# completo. Si baja, pasa a la ventana de confirmación del Nivel 0.
+verificar_escalada_nivel0() {
+  log "Iniciando ventana de escalada del Nivel 0 (~${SEGUNDOS_ESCALADA}s)."
+  local i uso_actual
+  for (( i=0; i<LECTURAS_ESCALADA; i++ )); do
+    sleep "$INTERVALO"
+    uso_actual=$(obtener_uso_cpu)
+    if [ "$uso_actual" -lt "$UMBRAL" ]; then
+      log "CPU bajó a ${uso_actual}% durante la ventana de escalada del Nivel 0. Se cancela el paso al Nivel 1."
+      verificar_confirmacion_nivel0
+      return
+    fi
+  done
+  log "Nivel 0: la CPU sigue en ${UMBRAL}%+ tras detener solo el stack '${STACK_NIVEL0}'. Escalando al Nivel 1 (todos los no-Coolify)."
+  STACK_NIVEL0=""
+  detener_contenedores_no_coolify
+  verificar_escalada
+}
+
+# Tras cancelarse el paso al Nivel 1 desde el Nivel 0, vigila
+# SEGUNDOS_CONFIRMACION segundos con la CPU por debajo del umbral antes de
+# restaurar el stack detenido. Si la CPU vuelve a subir al umbral durante
+# esta ventana, se escala directamente al Nivel 1 (sin volver a pasar por
+# la ventana de escalada).
+verificar_confirmacion_nivel0() {
+  log "Iniciando ventana de confirmación del Nivel 0 (~${SEGUNDOS_CONFIRMACION}s) antes de restaurar el stack '${STACK_NIVEL0}'."
+  local i uso_actual
+  for (( i=0; i<LECTURAS_CONFIRMACION; i++ )); do
+    sleep "$INTERVALO"
+    uso_actual=$(obtener_uso_cpu)
+    if [ "$uso_actual" -ge "$UMBRAL" ]; then
+      log "CPU volvió a subir a ${uso_actual}% durante la confirmación del Nivel 0. Se asume que el problema persiste."
+      log "Se escala directamente al Nivel 1 sin esperar una nueva ventana de escalada."
+      STACK_NIVEL0=""
+      detener_contenedores_no_coolify
+      verificar_escalada
+      return
+    fi
+  done
+  log "CPU estable por debajo de ${UMBRAL}% durante ${SEGUNDOS_CONFIRMACION}s. Restaurando el stack '${STACK_NIVEL0}'..."
+  restaurar_stack "$STACK_NIVEL0"
+  log "Incidente cerrado. Stack '${STACK_NIVEL0}' restaurado automáticamente; el resto nunca se detuvo."
+  STACK_NIVEL0=""
+  cerrar_incidente
 }
 
 # Nivel 1: detiene todos los contenedores del snapshot EXCEPTO los de Coolify.
@@ -362,9 +569,8 @@ activar_bloqueo() {
 
 # Tras el Nivel 1, vigila SEGUNDOS_ESCALADA segundos más. Si la CPU se
 # mantiene en >= UMBRAL% durante toda la ventana, escala al Nivel 2.
-# Si baja del umbral en cualquier lectura, cancela la escalada y cierra
-# el incidente (los contenedores no-Coolify quedan detenidos para revisión
-# manual; Coolify sigue arriba para poder levantarlos desde su panel).
+# Si baja del umbral en cualquier lectura, pasa a la ventana de
+# confirmación para intentar restaurar automáticamente el Nivel 1.
 verificar_escalada() {
   log "Iniciando ventana de escalada (~${SEGUNDOS_ESCALADA}s) tras el Nivel 1."
   local i uso_actual
@@ -373,12 +579,73 @@ verificar_escalada() {
     uso_actual=$(obtener_uso_cpu)
     if [ "$uso_actual" -lt "$UMBRAL" ]; then
       log "CPU bajó a ${uso_actual}% durante la ventana de escalada. Se cancela el Nivel 2."
-      log "Incidente cerrado. Los contenedores no-Coolify siguen detenidos; revísalos manualmente en Coolify."
-      cerrar_incidente
+      verificar_confirmacion_y_restaurar
       return
     fi
   done
   detener_todos_los_contenedores
+}
+
+# Tras cancelarse el Nivel 2, vigila SEGUNDOS_CONFIRMACION segundos MÁS con
+# la CPU por debajo del umbral antes de restaurar los contenedores
+# no-Coolify del Nivel 1. Si en cualquier lectura de esta ventana la CPU
+# vuelve a subir al umbral, se asume que el problema persiste y se escala
+# directamente al Nivel 2 (apagar también Coolify + reinicio automático),
+# sin volver a pasar por la ventana de escalada.
+verificar_confirmacion_y_restaurar() {
+  log "Iniciando ventana de confirmación (~${SEGUNDOS_CONFIRMACION}s) antes de restaurar el Nivel 1."
+  local i uso_actual
+  for (( i=0; i<LECTURAS_CONFIRMACION; i++ )); do
+    sleep "$INTERVALO"
+    uso_actual=$(obtener_uso_cpu)
+    if [ "$uso_actual" -ge "$UMBRAL" ]; then
+      log "CPU volvió a subir a ${uso_actual}% durante la ventana de confirmación. Se asume que el problema persiste."
+      log "Se escala directamente al Nivel 2 sin esperar una nueva ventana de escalada."
+      detener_todos_los_contenedores
+      return
+    fi
+  done
+  log "CPU estable por debajo de ${UMBRAL}% durante ${SEGUNDOS_CONFIRMACION}s. Restaurando contenedores no-Coolify del Nivel 1..."
+  restaurar_nivel1
+  log "Incidente cerrado. Contenedores no-Coolify restaurados automáticamente."
+  cerrar_incidente
+}
+
+# Restaura únicamente los contenedores no-Coolify que fueron detenidos en
+# el Nivel 1 (a partir del snapshot del incidente actual), agrupando por
+# proyecto de docker compose igual que restaurar_contenedores.
+restaurar_nivel1() {
+  if [ ! -s "$SNAPSHOT_ACTUAL" ]; then
+    log "No hay snapshot del incidente actual. Nada que restaurar."
+    return
+  fi
+
+  local -A grupos
+  local sueltos=()
+  while IFS='|' read -r id nombre imagen proyecto servicio; do
+    [ -z "$id" ] && continue
+    local es_coolify=false
+    for ex in "${EXCLUIDOS[@]}"; do
+      [ "$nombre" == "$ex" ] && es_coolify=true && break
+    done
+    [ "$es_coolify" = true ] && continue
+
+    if [ -n "$proyecto" ]; then
+      grupos["$proyecto"]="${grupos[$proyecto]:-}${grupos[$proyecto]:+ }$id"
+    else
+      sueltos+=("$id")
+    fi
+  done < "$SNAPSHOT_ACTUAL"
+
+  for proyecto in "${!grupos[@]}"; do
+    log "  levantando proyecto docker compose '${proyecto}': ${grupos[$proyecto]}"
+    docker start ${grupos[$proyecto]} >> "$LOG_FILE" 2>&1
+  done
+
+  if [ "${#sueltos[@]}" -gt 0 ]; then
+    log "  levantando contenedores independientes: ${sueltos[*]}"
+    docker start "${sueltos[@]}" >> "$LOG_FILE" 2>&1
+  fi
 }
 
 # Se ejecuta al arrancar el script (típicamente tras el reinicio automático
@@ -495,7 +762,7 @@ if [ -f "$MARCADOR_RESTAURAR" ]; then
 fi
 
 # ---------------------- Loop principal ----------------------
-log "cpu-guard iniciado. Umbral=${UMBRAL}% sostenido ${SEGUNDOS_SOSTENIDOS}s (Nivel 1) / ${SEGUNDOS_ESCALADA}s adicionales (Nivel 2, incluye Coolify + reinicio automático)."
+log "cpu-guard iniciado. Umbral=${UMBRAL}% sostenido ${SEGUNDOS_SOSTENIDOS}s (Nivel 0: aísla el stack más pesado) / ${SEGUNDOS_ESCALADA}s por nivel si no se resuelve (Nivel 1: todos los no-Coolify, Nivel 2: +Coolify y reinicio automático) / ${SEGUNDOS_CONFIRMACION}s de confirmación para restaurar."
 contador=0
 ultimo_disparo=0
 while true; do
@@ -521,9 +788,8 @@ while true; do
     if [ "$tiempo_desde_ultimo" -ge "$COOLDOWN_SEGUNDOS" ]; then
       iniciar_incidente
       capturar_snapshot_actual
-      detener_contenedores_no_coolify
       ultimo_disparo=$ahora
-      verificar_escalada
+      intentar_nivel0
     fi
     contador=0
   fi
