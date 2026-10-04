@@ -1,22 +1,3 @@
-import React from "react";
-import { 
-      A,
-      BR,
-      Badge,
-      Col4,
-      Container,
-      Div,
-      H4,
-      H6,
-      HR,
-      Img,
-      LI,
-      Layout,
-      P,
-      Row,
-      Span,
-      UL
-    } from "@react-pdf-levelup/core";
 
 
 // ────────────────────────────────────────────────────────────
@@ -243,7 +224,7 @@ const stackTecnicoDefault: StackCategoria[] = [
 
 const perfilProfesionalDefault: string[] = [
   "Ingeniero Informático y Full Stack Developer especializado en JavaScript/TypeScript, con más de 8 años de experiencia en desarrollo de software.",
-  "Experiencia construyendo aplicaciones de extremo a extremo, desde el análisis de requerimientos, arquitectura y bases de datos hasta el desarrollo de APIs e interfaces con React y Next.js.",
+  "Experiencia construyendo aplicaciones de extremo a extremo, desde el análisis de requerimientos, arquitectura y bases de datos hasta el desarrollo de APIs e interfaces.",
   "He trabajado en proyectos para instituciones educativas, organizaciones profesionales, medios de comunicación y agencias de marketing, participando en el desarrollo, mantenimiento y evolución de sistemas.",
   "Especializado en crear software modular, mantenible y orientado al rendimiento, con experiencia adicional en generación de documentos, migración de datos, administración de servidores y despliegue de aplicaciones.",
 ];
