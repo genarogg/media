@@ -6,8 +6,8 @@
 # Genera un archivo: vps_report_<hostname>_<fecha>.txt
 
 # para ejecutar
-# curl -o cpu-guard.sh https://genarogg.github.io/media/server/vps-health-check.sh
-# sudo bash cpu-guard.sh
+# curl -o vps-health-check.sh https://genarogg.github.io/media/server/vps-health-check.sh
+# sudo bash vps-health-check.sh
 
 set -u
 
