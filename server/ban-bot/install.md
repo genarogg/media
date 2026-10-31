@@ -2,7 +2,7 @@
 ssh usuario@tu-servidor
 
 # Descarga el zip
-wget https://genarogg.github.io/media/server/ban-bot/-package.zip
+wget https://genarogg.github.io/media/server/ban-bot/ban-bot-package.zip
 
 # Si no tienes unzip instalado
 sudo apt install -y unzip
