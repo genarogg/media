@@ -25,4 +25,4 @@ sudo ban-bot --list
 sudo ban-bot --delete "SemrushBot"
 
 # Verificar que el bloqueo funciona (debería devolver HTTP/2 403)
-curl -A "Mozilla/5.0 (compatible; SemrushBot/7~bl)" -I https://tu-dominio.com/
+curl -A "Mozilla/5.0 (compatible; SemrushBot/7~bl)" -I https://eltubazodigital.com
