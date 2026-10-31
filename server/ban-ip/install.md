@@ -2,7 +2,7 @@
 ssh usuario@tu-servidor
 
 # Descarga el zip
-wget https://genarogg.github.io/media/server/ban-ip-package.zip
+wget https://genarogg.github.io/media/server/ban-ip/ban-ip-package.zip
 
 # Si no tienes unzip instalado
 sudo apt install -y unzip
